@@ -1,0 +1,11 @@
+name = "temporary-media-storage"
+main = "_worker.js"
+compatibility_date = "2026-03-02"
+
+[[r2_buckets]]
+binding = "aloss"
+bucket_name = "temporary-media-storage"
+
+[triggers]
+crons = ["0 0 * * *"]
+
