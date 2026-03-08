@@ -16,9 +16,12 @@ export default {
     if (request.method === "PUT" && path.startsWith("/upload/")) {
       const key = path.replace("/upload/", "")
       const contentType = request.headers.get("content-type") || ""
-      const fileSize = Number(request.headers.get("Content-Length") || "0")
+      const contentLength = Number(request.headers.get("Content-Length") || "0")
+      const headerFileSize = Number(request.headers.get("x-file-size") || "0")
+      const fileSize = headerFileSize || contentLength
 
       const MAX_FILE_SIZE = 50 * 1024 * 1024 // 50MB
+      if (!fileSize || Number.isNaN(fileSize)) return new Response("Missing file size", { status: 400 })
       if (fileSize > MAX_FILE_SIZE) return new Response("File too large. Max 50MB.", { status: 400 })
 
       const normalizedContentType = contentType.split(";")[0].trim().toLowerCase()
@@ -205,6 +208,63 @@ h2::before {
     font-size: 0.85rem;
 }
 .lang-toggle:hover { background: var(--color-main-3); }
+
+#uploadProgress {
+    width: 100%;
+    max-width: 600px;
+    background: rgba(255, 255, 255, 0.92);
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-md);
+    box-shadow: 0 6px 18px rgba(10, 181, 220, 0.08);
+    padding: 12px 14px;
+    margin: 0 0 22px;
+}
+
+.upload-progress-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+#uploadProgressText {
+    font-size: 0.9rem;
+    font-weight: 800;
+    color: var(--text-main);
+}
+
+#uploadProgressPercent {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--secondary);
+}
+
+.upload-progress-detail {
+    margin-top: 10px;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.upload-progress-bar {
+    width: 100%;
+    height: 8px;
+    background: var(--color-main-3);
+    border-radius: 9999px;
+    overflow: hidden;
+}
+
+#uploadProgressFill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, var(--primary), var(--primary-hover));
+    border-radius: 9999px;
+    transition: width 0.25s ease-out;
+}
 
 #storageStats { 
     background: var(--color-main-3); 
@@ -393,6 +453,20 @@ img, video {
         <input id="fileInput" type="file" multiple accept="image/png,image/jpeg,image/jpg,image/gif,image/webp,video/mp4" hidden />
     </div>
 
+    <div id="uploadProgress" hidden>
+        <div class="upload-progress-row">
+            <div id="uploadProgressText">上传进度：0/0</div>
+            <div id="uploadProgressPercent">0%</div>
+        </div>
+        <div class="upload-progress-bar">
+            <div id="uploadProgressFill"></div>
+        </div>
+        <div class="upload-progress-detail">
+            <div id="uploadProgressBytes">0 B / 0 B</div>
+            <div id="uploadProgressSpeed"></div>
+        </div>
+    </div>
+
     <div id="list"></div>
 </div>
 
@@ -408,6 +482,12 @@ const toastContainer=document.getElementById("toastContainer")
 const langToggle=document.getElementById("langToggle")
 const pageTitle=document.getElementById("pageTitle")
 const dropText=document.getElementById("dropText")
+const uploadProgress=document.getElementById("uploadProgress")
+const uploadProgressText=document.getElementById("uploadProgressText")
+const uploadProgressFill=document.getElementById("uploadProgressFill")
+const uploadProgressPercent=document.getElementById("uploadProgressPercent")
+const uploadProgressBytes=document.getElementById("uploadProgressBytes")
+const uploadProgressSpeed=document.getElementById("uploadProgressSpeed")
 
 const TITLE_SUFFIX=" - Temporary-media-storage-cloudflare"
 
@@ -430,6 +510,9 @@ const I18N={
     deleteFail:"删除失败",
     uploadSuccess:"上传成功",
     uploadFail:"上传失败",
+    uploadProgressText:(current,total)=>"上传进度："+current+"/"+total,
+    uploadProgressDone:"上传完成",
+    etaLabel:"剩余",
     invalidMedia:"只允许上传 png/jpg/jpeg/gif/webp 图片或 mp4 视频",
     fileTooLarge:"文件过大，最大50MB",
     insufficientSpace:"可用空间不足，无法上传",
@@ -454,6 +537,9 @@ const I18N={
     deleteFail:"Delete failed",
     uploadSuccess:"Uploaded",
     uploadFail:"Upload failed",
+    uploadProgressText:(current,total)=>"Upload: "+current+"/"+total,
+    uploadProgressDone:"Upload complete",
+    etaLabel:"ETA",
     invalidMedia:"Only png/jpg/jpeg/gif/webp images or mp4 videos are allowed",
     fileTooLarge:"File too large (max 50MB)",
     insufficientSpace:"Insufficient storage space",
@@ -464,6 +550,14 @@ const I18N={
 
 let currentLang="zh"
 let lastStats=null
+let uploadQueue=[]
+let uploadTotal=0
+let uploadDone=0
+let uploading=false
+let uploadBytesTotal=0
+let uploadBytesDone=0
+let currentFileLoaded=0
+let currentSpeedBps=0
 
 function resolveDefaultLang(){
   const saved=localStorage.getItem("lang")
@@ -485,6 +579,7 @@ function setLang(lang){
   if(pageTitle) pageTitle.innerText=t("title")
   if(dropText) dropText.innerText=t("dropHint")
   if(uploadBtn) uploadBtn.innerText=t("uploadButton")
+  updateUploadProgressUI()
   if(storageStats){
     if(lastStats){
       storageStats.innerText=I18N[currentLang].statsText(lastStats)
@@ -504,6 +599,139 @@ function setLang(lang){
   document.querySelectorAll("[data-role='delete']").forEach(btn=>{
     btn.innerText=t("delete")
   })
+}
+
+function setUploadProgressVisible(visible){
+  if(!uploadProgress) return
+  uploadProgress.hidden=!visible
+}
+
+function updateUploadProgressUI(){
+  if(!uploadProgress || uploadProgress.hidden) return
+  if(!uploadProgressText || !uploadProgressFill || !uploadProgressPercent) return
+  if(!uploadProgressBytes || !uploadProgressSpeed) return
+  if(uploadTotal<=0 || uploadBytesTotal<=0){
+    uploadProgressText.innerText=I18N[currentLang].uploadProgressText(0, 0)
+    uploadProgressFill.style.width="0%"
+    uploadProgressPercent.innerText="0%"
+    uploadProgressBytes.innerText="0 B / 0 B"
+    uploadProgressSpeed.innerText=""
+    return
+  }
+
+  const uploadedBytes=Math.max(0, Math.min(uploadBytesTotal, uploadBytesDone + currentFileLoaded))
+  const percent=Math.max(0, Math.min(100, Math.floor((uploadedBytes / uploadBytesTotal) * 100)))
+  uploadProgressFill.style.width=percent+"%"
+  uploadProgressPercent.innerText=percent+"%"
+
+  const up=formatBytes(uploadedBytes)
+  const total=formatBytes(uploadBytesTotal)
+  uploadProgressBytes.innerText=up.value+" "+up.unit+" / "+total.value+" "+total.unit
+
+  let speedText=""
+  if(uploading && currentSpeedBps>0){
+    speedText=formatSpeed(currentSpeedBps)
+    const remainingBytes=Math.max(0, uploadBytesTotal - uploadedBytes)
+    const etaSeconds=remainingBytes / currentSpeedBps
+    if(isFinite(etaSeconds) && etaSeconds>=0){
+      speedText=speedText+" · "+t("etaLabel")+" "+formatDuration(etaSeconds)
+    }
+  }
+  uploadProgressSpeed.innerText=speedText
+
+  if(uploading){
+    const current=Math.min(uploadDone+1, Math.max(uploadTotal, 1))
+    uploadProgressText.innerText=I18N[currentLang].uploadProgressText(current, uploadTotal)
+  }else if(uploadDone>=uploadTotal){
+    uploadProgressText.innerText=t("uploadProgressDone")
+  }else{
+    uploadProgressText.innerText=I18N[currentLang].uploadProgressText(uploadDone, uploadTotal)
+  }
+}
+
+function formatBytes(bytes){
+  const b=Math.max(0, Number(bytes)||0)
+  const units=["B","KB","MB","GB","TB"]
+  let value=b
+  let unitIndex=0
+  while(value>=1024 && unitIndex<units.length-1){
+    value=value/1024
+    unitIndex++
+  }
+  const fixed=value>=100 ? 0 : (value>=10 ? 1 : 2)
+  return { value: value.toFixed(fixed), unit: units[unitIndex] }
+}
+
+function formatSpeed(bytesPerSecond){
+  const f=formatBytes(bytesPerSecond)
+  return f.value+" "+f.unit+"/s"
+}
+
+function formatDuration(seconds){
+  const s=Math.max(0, Math.floor(Number(seconds)||0))
+  const h=Math.floor(s/3600)
+  const m=Math.floor((s%3600)/60)
+  const sec=s%60
+  const pad=(n)=>String(n).padStart(2,"0")
+  if(h>0) return h+":"+pad(m)+":"+pad(sec)
+  return m+":"+pad(sec)
+}
+
+async function enqueueUploads(fileList){
+  const files=Array.from(fileList||[])
+  if(files.length===0) return
+
+  if(!uploading){
+    uploadQueue=[]
+    uploadTotal=0
+    uploadDone=0
+    uploadBytesTotal=0
+    uploadBytesDone=0
+    currentFileLoaded=0
+    currentSpeedBps=0
+  }
+
+  for(const file of files){
+    uploadQueue.push(file)
+    uploadTotal++
+    uploadBytesTotal+=Number(file.size||0)
+  }
+
+  setUploadProgressVisible(true)
+  updateUploadProgressUI()
+  if(!uploading) await processUploadQueue()
+}
+
+async function processUploadQueue(){
+  uploading=true
+  updateUploadProgressUI()
+  try{
+    while(uploadQueue.length){
+      const file=uploadQueue.shift()
+      currentFileLoaded=0
+      currentSpeedBps=0
+      updateUploadProgressUI()
+      const ok=await uploadFile(file)
+      if(ok){
+        uploadDone++
+        uploadBytesDone+=Number(file.size||0)
+      }else{
+        uploadTotal=Math.max(0, uploadTotal-1)
+        uploadBytesTotal=Math.max(0, uploadBytesTotal-Number(file.size||0))
+      }
+      currentFileLoaded=0
+      currentSpeedBps=0
+      updateUploadProgressUI()
+    }
+  }finally{
+    uploading=false
+    updateUploadProgressUI()
+    setTimeout(()=>{
+      if(!uploading && uploadQueue.length===0){
+        setUploadProgressVisible(false)
+      }
+    },2500)
+  }
 }
 
 function isAllowedMedia(file){
@@ -595,23 +823,75 @@ async function copyTextToClipboard(text){
 }
 
 async function uploadFile(file){
-  if(!isAllowedMedia(file)){alert(t("invalidMedia"));return}
+  if(!isAllowedMedia(file)){alert(t("invalidMedia"));return false}
 
   const MAX_FILE_SIZE = 50*1024*1024
-  if(file.size>MAX_FILE_SIZE){alert(t("fileTooLarge"));return}
+  if(file.size>MAX_FILE_SIZE){alert(t("fileTooLarge"));return false}
 
   // ===== 检查可用空间 =====
   const statsRes = await fetch("/stats")
   const stats = await statsRes.json()
   const remainingBytes = stats.remainingGB * 1024 * 1024 * 1024
-  if(file.size > remainingBytes){alert(t("insufficientSpace"));return}
+  if(file.size > remainingBytes){alert(t("insufficientSpace"));return false}
 
   const key=genKey(file)
-  const uploadRes=await fetch("/upload/"+key,{method:"PUT",body:file,headers:{"Content-Type":file.type,"Content-Length":file.size}})
-  if(!uploadRes.ok){showToast(t("uploadFail"),"error");return}
+  const contentType=getUploadContentType(file)
+  const ok=await uploadViaXHR("/upload/"+key, file, contentType, (loaded, total, speedBps)=>{
+    currentFileLoaded=loaded
+    if(speedBps>0){
+      currentSpeedBps=currentSpeedBps>0 ? (currentSpeedBps*0.7 + speedBps*0.3) : speedBps
+    }
+    updateUploadProgressUI()
+  })
+  if(!ok){showToast(t("uploadFail"),"error");return false}
   showFile(key)
   loadStats()
   showToast(t("uploadSuccess"))
+  return true
+}
+
+function getUploadContentType(file){
+  const mime=String(file.type||"").split(";")[0].trim().toLowerCase()
+  if(mime) return mime
+  const name=String(file.name||"").toLowerCase()
+  if(name.endsWith(".png")) return "image/png"
+  if(name.endsWith(".jpg")||name.endsWith(".jpeg")) return "image/jpeg"
+  if(name.endsWith(".gif")) return "image/gif"
+  if(name.endsWith(".webp")) return "image/webp"
+  if(name.endsWith(".mp4")) return "video/mp4"
+  return "application/octet-stream"
+}
+
+function uploadViaXHR(url, file, contentType, onProgress){
+  return new Promise(resolve=>{
+    const xhr=new XMLHttpRequest()
+    let lastTime=performance.now()
+    let lastLoaded=0
+
+    xhr.open("PUT", url, true)
+    if(contentType) xhr.setRequestHeader("Content-Type", contentType)
+    xhr.setRequestHeader("X-File-Size", String(file.size||0))
+
+    xhr.upload.onprogress=(e)=>{
+      if(!e || !e.lengthComputable) return
+      const now=performance.now()
+      const dt=(now-lastTime)/1000
+      let speed=0
+      if(dt>0){
+        speed=(e.loaded-lastLoaded)/dt
+      }
+      lastTime=now
+      lastLoaded=e.loaded
+      if(typeof onProgress==="function") onProgress(e.loaded, e.total, speed)
+    }
+
+    xhr.onload=()=>{
+      resolve(xhr.status>=200 && xhr.status<300)
+    }
+    xhr.onerror=()=>resolve(false)
+    xhr.onabort=()=>resolve(false)
+    xhr.send(file)
+  })
 }
 
 // ===== 文件列表 =====
@@ -638,13 +918,13 @@ async function loadStats(){
 drop.ondragover=e=>e.preventDefault()
 drop.ondrop=e=>{
   e.preventDefault()
-  for(const file of e.dataTransfer.files){uploadFile(file)}
+  enqueueUploads(e.dataTransfer.files)
 }
 
 // ===== 按钮上传 =====
 uploadBtn.onclick=()=>fileInput.click()
 fileInput.onchange=()=>{
-  for(const file of fileInput.files){uploadFile(file)}
+  enqueueUploads(fileInput.files)
   fileInput.value=""
 }
 
